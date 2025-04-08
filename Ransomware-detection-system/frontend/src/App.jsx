@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Box, Typography, Paper, List, ListItem, ListItemText, Divider, Chip, CircularProgress, Alert, Switch, FormControlLabel, Button } from '@mui/material';
-import { Warning, Error, Info, Security, Block, CheckCircle } from '@mui/icons-material';
+import { Box, Typography, Paper, List, ListItem, ListItemText, Divider, Chip, CircularProgress, Alert, Switch, FormControlLabel, Button, Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
+import { Warning, Error, Info, Security, Block, CheckCircle, Folder, Dangerous } from '@mui/icons-material';
 import { Bar } from 'react-chartjs-2';
 import axios from 'axios';
 import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend } from 'chart.js';
@@ -22,6 +22,10 @@ function App() {
   const [blockMode, setBlockMode] = useState(true);
   const [testResults, setTestResults] = useState([]);
   const [testMode, setTestMode] = useState(false);
+  const [detectedFiles, setDetectedFiles] = useState([]);
+  const [quarantineFiles, setQuarantineFiles] = useState([]);
+  const [openDetectedDialog, setOpenDetectedDialog] = useState(false);
+  const [openQuarantineDialog, setOpenQuarantineDialog] = useState(false);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -85,7 +89,6 @@ function App() {
       const response = await axios.post('http://localhost:5000/api/test/create_files');
       setTestResults(response.data.results);
       setTestMode(true);
-      // Refresh alerts after a short delay to see detection results
       setTimeout(() => {
         axios.get('http://localhost:5000/api/alerts')
           .then(res => setAlerts(res.data))
@@ -101,13 +104,40 @@ function App() {
       await axios.post('http://localhost:5000/api/test/cleanup');
       setTestResults([]);
       setTestMode(false);
-      // Refresh alerts to clear any test-related alerts
       axios.get('http://localhost:5000/api/alerts')
         .then(res => setAlerts(res.data))
         .catch(console.error);
     } catch (error) {
       console.error("Error cleaning up test files:", error);
     }
+  };
+
+  const handleOpenDetectedDialog = async () => {
+    try {
+      const detected = alerts.filter(alert => alert.action_taken === 'Detected');
+      setDetectedFiles(detected);
+      setOpenDetectedDialog(true);
+    } catch (error) {
+      console.error("Error fetching detected files:", error);
+    }
+  };
+
+  const handleCloseDetectedDialog = () => {
+    setOpenDetectedDialog(false);
+  };
+
+  const handleOpenQuarantineDialog = async () => {
+    try {
+      const quarantined = alerts.filter(alert => alert.action_taken === 'Quarantined');
+      setQuarantineFiles(quarantined);
+      setOpenQuarantineDialog(true);
+    } catch (error) {
+      console.error("Error fetching quarantine files:", error);
+    }
+  };
+
+  const handleCloseQuarantineDialog = () => {
+    setOpenQuarantineDialog(false);
   };
 
   const systemHealthData = {
@@ -152,14 +182,99 @@ function App() {
     <Box sx={{ p: 3 }}>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
         <Typography variant="h3">Ransomware Detection System</Typography>
-        <FormControlLabel
-          control={<Switch checked={blockMode} onChange={toggleBlockMode} />}
-          label={blockMode ? "Block Mode: ON" : "Block Mode: OFF"}
-          labelPlacement="start"
-          sx={{ ml: 0 }}
-        />
+        <Box display="flex" alignItems="center" gap={2}>
+          <Button 
+            variant="outlined" 
+            startIcon={<Dangerous />}
+            onClick={handleOpenDetectedDialog}
+          >
+            Detected Files
+          </Button>
+          <Button 
+            variant="outlined" 
+            startIcon={<Folder />}
+            onClick={handleOpenQuarantineDialog}
+          >
+            Quarantine Files
+          </Button>
+          <FormControlLabel
+            control={<Switch checked={blockMode} onChange={toggleBlockMode} />}
+            label={blockMode ? "Block Mode: ON" : "Block Mode: OFF"}
+            labelPlacement="start"
+            sx={{ ml: 0 }}
+          />
+        </Box>
       </Box>
 
+      {/* Detected Files Dialog */}
+      <Dialog 
+        open={openDetectedDialog} 
+        onClose={handleCloseDetectedDialog}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Detected Files</DialogTitle>
+        <DialogContent>
+          {detectedFiles.length > 0 ? (
+            <List dense>
+              {detectedFiles.map((file, index) => (
+                <ListItem key={`detected-${index}`}>
+                  <ListItemText
+                    primary={file.path}
+                    secondary={`Detected at: ${new Date(file.timestamp).toLocaleString()}`}
+                  />
+                  <Chip 
+                    label="Detected" 
+                    color="warning" 
+                    variant="outlined"
+                  />
+                </ListItem>
+              ))}
+            </List>
+          ) : (
+            <Alert severity="info">No detected files found</Alert>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseDetectedDialog}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Quarantine Files Dialog */}
+      <Dialog 
+        open={openQuarantineDialog} 
+        onClose={handleCloseQuarantineDialog}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Quarantine Files</DialogTitle>
+        <DialogContent>
+          {quarantineFiles.length > 0 ? (
+            <List dense>
+              {quarantineFiles.map((file, index) => (
+                <ListItem key={`quarantined-${index}`}>
+                  <ListItemText
+                    primary={file.path}
+                    secondary={`Quarantined at: ${new Date(file.timestamp).toLocaleString()}`}
+                  />
+                  <Chip 
+                    label="Quarantined" 
+                    color="error" 
+                    variant="outlined"
+                  />
+                </ListItem>
+              ))}
+            </List>
+          ) : (
+            <Alert severity="info">No files currently in quarantine</Alert>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseQuarantineDialog}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Rest of your existing UI components remain unchanged */}
       <Box sx={{ display: 'flex', gap: 3, mb: 3 }}>
         <Paper sx={{ p: 2, flex: 1 }}>
           <Typography variant="h6" gutterBottom>System Health</Typography>
