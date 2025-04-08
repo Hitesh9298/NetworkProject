@@ -15,6 +15,8 @@ import threading
 import numpy as np
 from datetime import datetime
 from test_utils import generate_test_files, cleanup_test_files, TEST_DIR
+import socket
+import random
 
 app = Flask(__name__)
 CORS(app)
@@ -318,6 +320,82 @@ def create_test_files():
         })
     except Exception as e:
         print(f"[ERROR] Creating test files: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+        # Add to imports at the top
+import socket
+import random
+
+# Add these new endpoints
+@app.route('/api/test/network', methods=['POST'])
+def test_network_activity():
+    """Simulate suspicious network activity"""
+    try:
+        # Simulate large data transfer
+        bytes_sent = random.randint(50*1024*1024, 100*1024*1024)  # 50-100 MB
+        bytes_recv = random.randint(50*1024*1024, 100*1024*1024)  # 50-100 MB
+        
+        # Create an alert for the simulated activity
+        alert = {
+            'type': 'network',
+            'severity': 'high',
+            'message': f'Simulated network test: Sent {bytes_sent/1024/1024:.2f}MB, Received {bytes_recv/1024/1024:.2f}MB',
+            'timestamp': datetime.now().isoformat(),
+            'action_taken': 'Detected (Test)'
+        }
+        
+        with ALERTS_LOCK:
+            ALERTS.append(alert)
+        
+        return jsonify({
+            'status': 'success',
+            'stats': {
+                'bytes_sent': bytes_sent,
+                'bytes_recv': bytes_recv
+            },
+            'message': 'Network test executed successfully'
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/test/block_connection', methods=['POST'])
+def test_block_connection():
+    """Test blocking a malicious connection"""
+    try:
+        if not BLOCK_MODE:
+            return jsonify({
+                'status': 'success',
+                'blocked': False,
+                'message': 'Block mode is disabled - no action taken'
+            })
+        
+        # Simulate blocking a connection
+        malicious_ip = ".".join(map(str, (random.randint(0, 255) for _ in range(4))))
+        
+        alert = {
+            'type': 'network',
+            'severity': 'critical',
+            'message': f'Blocked connection to malicious IP: {malicious_ip}',
+            'timestamp': datetime.now().isoformat(),
+            'action_taken': 'Blocked (Test)'
+        }
+        
+        with ALERTS_LOCK:
+            ALERTS.append(alert)
+        
+        return jsonify({
+            'status': 'success',
+            'blocked': True,
+            'ip': malicious_ip,
+            'message': f'Successfully blocked test connection to {malicious_ip}'
+        })
+    except Exception as e:
         return jsonify({
             'status': 'error',
             'message': str(e)

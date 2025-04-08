@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Box, Typography, Paper, List, ListItem, ListItemText, Divider, Chip, CircularProgress, Alert, Switch, FormControlLabel, Button, Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
-import { Warning, Error, Info, Security, Block, CheckCircle, Folder, Dangerous } from '@mui/icons-material';
+import { Warning, Error, Info, Security, Block, CheckCircle, Folder, Dangerous, NetworkWifi, WifiOff } from '@mui/icons-material';
 import { Bar } from 'react-chartjs-2';
 import axios from 'axios';
 import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend } from 'chart.js';
@@ -26,6 +26,9 @@ function App() {
   const [quarantineFiles, setQuarantineFiles] = useState([]);
   const [openDetectedDialog, setOpenDetectedDialog] = useState(false);
   const [openQuarantineDialog, setOpenQuarantineDialog] = useState(false);
+  const [networkTestActive, setNetworkTestActive] = useState(false);
+  const [connectionBlocked, setConnectionBlocked] = useState(false);
+  const [blockedIP, setBlockedIP] = useState('');
 
   useEffect(() => {
     const fetchData = async () => {
@@ -110,6 +113,45 @@ function App() {
     } catch (error) {
       console.error("Error cleaning up test files:", error);
     }
+  };
+
+  const testNetworkActivity = async () => {
+    try {
+      const response = await axios.post('http://localhost:5000/api/test/network');
+      setNetworkTestActive(true);
+      setTimeout(() => {
+        Promise.all([
+          axios.get('http://localhost:5000/api/stats'),
+          axios.get('http://localhost:5000/api/alerts')
+        ]).then(([statsRes, alertsRes]) => {
+          setStats(statsRes.data);
+          setAlerts(alertsRes.data);
+        }).catch(console.error);
+      }, 1000);
+    } catch (error) {
+      console.error("Error testing network activity:", error);
+    }
+  };
+
+  const testBlockConnection = async () => {
+    try {
+      const response = await axios.post('http://localhost:5000/api/test/block_connection');
+      setConnectionBlocked(response.data.blocked);
+      setBlockedIP(response.data.ip || '');
+      setTimeout(() => {
+        axios.get('http://localhost:5000/api/alerts')
+          .then(res => setAlerts(res.data))
+          .catch(console.error);
+      }, 1000);
+    } catch (error) {
+      console.error("Error testing connection blocking:", error);
+    }
+  };
+
+  const resetNetworkTests = () => {
+    setNetworkTestActive(false);
+    setConnectionBlocked(false);
+    setBlockedIP('');
   };
 
   const handleOpenDetectedDialog = async () => {
@@ -274,7 +316,6 @@ function App() {
         </DialogActions>
       </Dialog>
 
-      {/* Rest of your existing UI components remain unchanged */}
       <Box sx={{ display: 'flex', gap: 3, mb: 3 }}>
         <Paper sx={{ p: 2, flex: 1 }}>
           <Typography variant="h6" gutterBottom>System Health</Typography>
@@ -285,6 +326,52 @@ function App() {
           <Bar data={networkData} />
         </Paper>
       </Box>
+
+      <Paper sx={{ p: 2, mb: 3 }}>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+          <Typography variant="h6">Network Testing</Typography>
+          <Box display="flex" gap={1}>
+            <Button 
+              variant="contained" 
+              color="primary" 
+              onClick={testNetworkActivity}
+              disabled={networkTestActive}
+              startIcon={<NetworkWifi />}
+            >
+              Simulate Network Spike
+            </Button>
+            <Button 
+              variant="contained" 
+              color="secondary" 
+              onClick={testBlockConnection}
+              disabled={connectionBlocked}
+              startIcon={<Security />}
+            >
+              Test Connection Block
+            </Button>
+            <Button 
+              variant="outlined" 
+              onClick={resetNetworkTests}
+              disabled={!networkTestActive && !connectionBlocked}
+              startIcon={<WifiOff />}
+            >
+              Reset Tests
+            </Button>
+          </Box>
+        </Box>
+        
+        {networkTestActive && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Network spike test active - check alerts for detection
+          </Alert>
+        )}
+        
+        {connectionBlocked && (
+          <Alert severity="error">
+            Successfully blocked test connection to {blockedIP}
+          </Alert>
+        )}
+      </Paper>
 
       <Paper sx={{ p: 2, mb: 3 }}>
         <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
