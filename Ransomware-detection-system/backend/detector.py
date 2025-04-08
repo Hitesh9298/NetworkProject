@@ -3,6 +3,8 @@ import sys
 import time
 import yara
 import psutil
+import shutil
+import warnings
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from flask import Flask, jsonify, request
@@ -12,11 +14,12 @@ from watchdog.events import FileSystemEventHandler
 import threading
 import numpy as np
 from datetime import datetime
+from test_utils import generate_test_files, cleanup_test_files, TEST_DIR
 
 app = Flask(__name__)
 CORS(app)
 
-# Global variables for detection
+# Global variables with thread safety
 DETECTION_RULES = {
     'file_activity': [],
     'process_activity': [],
@@ -24,10 +27,15 @@ DETECTION_RULES = {
 }
 
 ALERTS = []
+ALERTS_LOCK = threading.Lock()
 DETECTION_MODEL = None
 BASELINE_STATS = {}
+BLOCK_MODE = True
 
-# YARA rules for ransomware detection
+# Directory paths
+QUARANTINE_DIR = os.path.join(os.path.dirname(__file__), 'quarantine')
+
+# YARA rules
 yara_rules = """
 rule ransomware_indicators {
     meta:
@@ -40,65 +48,136 @@ rule ransomware_indicators {
         any of them
 }
 """
-
-# Initialize YARA rules
 compiled_yara_rules = yara.compile(source=yara_rules)
 
 class FileEventHandler(FileSystemEventHandler):
-    def on_modified(self, event):
-        if not event.is_directory:
-            if self.is_suspicious_file(event.src_path):
-                alert = {
-                    'type': 'file',
-                    'severity': 'high',
-                    'message': f'Suspicious file activity detected: {event.src_path}',
-                    'timestamp': datetime.now().isoformat()
-                }
-                ALERTS.append(alert)
-                print(f"[ALERT] {alert['message']}")
+    def __init__(self):
+        super().__init__()
+        self.last_alert_times = {}
+        self.alert_rate_limit = 5  # Max alerts per minute per file
 
     def on_created(self, event):
         if not event.is_directory:
-            if self.is_suspicious_file(event.src_path):
-                alert = {
-                    'type': 'file',
-                    'severity': 'high',
-                    'message': f'Suspicious file creation detected: {event.src_path}',
-                    'timestamp': datetime.now().isoformat()
-                }
-                ALERTS.append(alert)
-                print(f"[ALERT] {alert['message']}")
+            self.process_file(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self.process_file(event.src_path)
+
+    def process_file(self, file_path):
+        # Count recent alerts for this file
+        now = time.time()
+        recent_alerts = [t for t in self.last_alert_times.get(file_path, []) if now - t < 60]
+        
+        if len(recent_alerts) < self.alert_rate_limit:
+            if self.is_suspicious_file(file_path):
+                self.handle_malicious_file(file_path)
+                self.last_alert_times.setdefault(file_path, []).append(now)
 
     def is_suspicious_file(self, file_path):
-        # Check file extension changes
-        if file_path.endswith('.encrypted') or file_path.endswith('.locked'):
-            return True
+        # Skip system and application directories
+        excluded_dirs = [
+            os.path.expanduser('~\\AppData'),
+            'Windows\\System32',
+            'Program Files',
+            'Program Files (x86)',
+            'node_modules',
+            'Microsoft VS Code',
+            'MSTeams',
+            'Google\\Chrome',
+            'BraveSoftware\\Brave-Browser',
+            'Local\\Temp'
+        ]
         
-        # Check with YARA rules
+        # Normalize path for comparison
+        normalized_path = os.path.normpath(file_path).lower()
+        
+        if any(excluded_dir.lower() in normalized_path for excluded_dir in excluded_dirs):
+            return False
+            
+        # Check extensions
+        suspicious_extensions = ('.encrypted', '.locked', '.crypt', '.ransom', '.cryp1', '.locky')
+        if file_path.lower().endswith(suspicious_extensions):
+            return True
+            
+        # Check YARA rules
         try:
-            matches = compiled_yara_rules.match(filepath=file_path)
-            if matches:
+            if compiled_yara_rules.match(filepath=file_path):
                 return True
         except:
             pass
-        
-        # Check for rapid file modifications
-        file_stats = os.stat(file_path)
-        if time.time() - file_stats.st_mtime < 5:  # Modified within last 5 seconds
-            return True
+            
+        # Check rapid modification
+        try:
+            stat = os.stat(file_path)
+            if time.time() - stat.st_mtime < 2 and os.path.getsize(file_path) > 102400:
+                return True
+        except:
+            pass
             
         return False
+
+    def handle_malicious_file(self, file_path):
+        now = time.time()
+        action = "Detected"
+        
+        if BLOCK_MODE:
+            try:
+                os.makedirs(QUARANTINE_DIR, exist_ok=True)
+                base_name = os.path.basename(file_path)
+                quarantine_path = os.path.join(QUARANTINE_DIR, f"{int(now)}_{base_name}")
+                
+                try:
+                    if os.path.exists(file_path):
+                        shutil.move(file_path, quarantine_path)
+                        action = "Quarantined"
+                except PermissionError:
+                    action = "Detection only (file in use)"
+                except Exception as e:
+                    action = f"Quarantine failed: {str(e)}"
+            except Exception as e:
+                action = f"System error: {str(e)}"
+
+        alert = {
+            'type': 'file',
+            'severity': 'high',
+            'message': f'{action} suspicious file: {os.path.basename(file_path)}',
+            'path': file_path,
+            'timestamp': datetime.now().isoformat(),
+            'action_taken': action
+        }
+        
+        # Thread-safe alert addition
+        with ALERTS_LOCK:
+            if not any(a.get('path') == file_path and 
+                      (now - datetime.fromisoformat(a['timestamp']).timestamp()) < 60 
+                      for a in ALERTS):
+                ALERTS.append(alert)
+                print(f"[ALERT] {alert['message']}")
 
 def monitor_file_system():
     event_handler = FileEventHandler()
     observer = Observer()
     
-    # Watch all drives (in a real system, you'd want to be more selective)
+    # Monitor test directory
+    try:
+        os.makedirs(TEST_DIR, exist_ok=True)
+        observer.schedule(event_handler, TEST_DIR, recursive=True)
+        print(f"[MONITOR] Watching test directory: {TEST_DIR}")
+    except Exception as e:
+        print(f"[ERROR] Failed to monitor test directory: {e}")
+
+    # Monitor system drives
     for drive in psutil.disk_partitions():
-        observer.schedule(event_handler, drive.mountpoint, recursive=True)
+        try:
+            if not any(excluded in drive.mountpoint.lower() 
+                      for excluded in ['windows', 'program files']):
+                observer.schedule(event_handler, drive.mountpoint, recursive=True)
+                print(f"[MONITOR] Watching drive: {drive.mountpoint}")
+        except Exception as e:
+            print(f"[ERROR] Failed to monitor {drive.mountpoint}: {e}")
     
     observer.start()
-    print("Starting file system monitoring...")
     
     try:
         while True:
@@ -115,16 +194,28 @@ def monitor_processes():
         time.sleep(5)
         current_cpu = psutil.cpu_percent(interval=1)
         
-        # Detect unusual CPU usage
-        if current_cpu > baseline_cpu * 2:  # If CPU usage doubled
-            alert = {
-                'type': 'process',
-                'severity': 'medium',
-                'message': f'Unusual CPU usage detected: {current_cpu}%',
-                'timestamp': datetime.now().isoformat()
-            }
-            ALERTS.append(alert)
-            print(f"[ALERT] {alert['message']}")
+        if current_cpu > baseline_cpu * 2:
+            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent']):
+                if proc.info['cpu_percent'] > 30:
+                    action = "Detected"
+                    if BLOCK_MODE:
+                        try:
+                            proc.kill()
+                            action = "Terminated"
+                        except:
+                            action = "Failed to terminate"
+                    
+                    alert = {
+                        'type': 'process',
+                        'severity': 'high',
+                        'message': f'{action} high-CPU process: {proc.info["name"]} (PID: {proc.info["pid"]}, CPU: {proc.info["cpu_percent"]}%)',
+                        'timestamp': datetime.now().isoformat(),
+                        'action_taken': action
+                    }
+                    
+                    with ALERTS_LOCK:
+                        ALERTS.append(alert)
+                    print(f"[ALERT] {alert['message']}")
 
 def monitor_network():
     baseline_network = psutil.net_io_counters()
@@ -137,45 +228,63 @@ def monitor_network():
         time.sleep(10)
         current_network = psutil.net_io_counters()
         
-        # Detect unusual network activity
         sent_diff = current_network.bytes_sent - BASELINE_STATS['network']['bytes_sent']
         recv_diff = current_network.bytes_recv - BASELINE_STATS['network']['bytes_recv']
         
-        if sent_diff > 10 * 1024 * 1024 or recv_diff > 10 * 1024 * 1024:  # 10MB threshold
+        if sent_diff > 10 * 1024 * 1024 or recv_diff > 10 * 1024 * 1024:
             alert = {
                 'type': 'network',
                 'severity': 'high',
                 'message': f'Unusual network activity detected: Sent {sent_diff/1024/1024:.2f}MB, Received {recv_diff/1024/1024:.2f}MB',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'action_taken': 'Detected'
             }
-            ALERTS.append(alert)
+            
+            with ALERTS_LOCK:
+                ALERTS.append(alert)
             print(f"[ALERT] {alert['message']}")
         
-        # Update baseline
         BASELINE_STATS['network'] = {
             'bytes_sent': current_network.bytes_sent,
             'bytes_recv': current_network.bytes_recv
         }
 
 def train_anomaly_detection():
-    # In a real system, you'd use historical data here
-    # For demo, we'll create some synthetic data
+    """Train the machine learning model for anomaly detection"""
     np.random.seed(42)
-    normal_data = np.random.normal(50, 10, (100, 3))  # Normal behavior
-    anomaly_data = np.random.normal(150, 30, (10, 3))  # Anomalous behavior
-    
+    normal_data = np.random.normal(50, 10, (100, 3))
+    anomaly_data = np.random.normal(150, 30, (10, 3))
     X = np.vstack([normal_data, anomaly_data])
-    
-    # Train Isolation Forest model
     global DETECTION_MODEL
     DETECTION_MODEL = IsolationForest(contamination=0.1, random_state=42)
     DETECTION_MODEL.fit(X)
-    print("Anomaly detection model trained")
+    print("[MODEL] Anomaly detection model trained")
 
-# Flask API endpoints
+def start_monitoring():
+    """Start all monitoring threads"""
+    def start_file_monitoring():
+        monitor_file_system()
+        
+    def start_process_monitoring():
+        monitor_processes()
+        
+    def start_network_monitoring():
+        monitor_network()
+
+    fs_thread = threading.Thread(target=start_file_monitoring, daemon=True)
+    proc_thread = threading.Thread(target=start_process_monitoring, daemon=True)
+    net_thread = threading.Thread(target=start_network_monitoring, daemon=True)
+    
+    fs_thread.start()
+    proc_thread.start()
+    net_thread.start()
+    print("[SYSTEM] Monitoring threads started")
+
+# API Endpoints
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
-    return jsonify(ALERTS)
+    with ALERTS_LOCK:
+        return jsonify(ALERTS)
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -186,42 +295,65 @@ def get_stats():
     }
     return jsonify(stats)
 
-@app.route('/api/scan', methods=['POST'])
-def scan_file():
-    file_path = request.json.get('path')
-    if not file_path or not os.path.exists(file_path):
-        return jsonify({'error': 'Invalid file path'}), 400
-    
-    try:
-        matches = compiled_yara_rules.match(filepath=file_path)
-        result = {
-            'path': file_path,
-            'is_malicious': len(matches) > 0,
-            'matches': [str(m) for m in matches]
-        }
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+@app.route('/api/block_mode', methods=['POST'])
+def set_block_mode():
+    global BLOCK_MODE
+    BLOCK_MODE = request.json.get('enabled', False)
+    return jsonify({'status': 'success', 'block_mode': BLOCK_MODE})
 
-def start_monitoring():
-    # Start file system monitoring in a separate thread
-    fs_thread = threading.Thread(target=monitor_file_system, daemon=True)
-    fs_thread.start()
-    
-    # Start process monitoring
-    proc_thread = threading.Thread(target=monitor_processes, daemon=True)
-    proc_thread.start()
-    
-    # Start network monitoring
-    net_thread = threading.Thread(target=monitor_network, daemon=True)
-    net_thread.start()
+@app.route('/api/test/create_files', methods=['POST'])
+def create_test_files():
+    try:
+        print(f"[TEST] Attempting to create test files in: {TEST_DIR}")
+        if not os.path.exists(TEST_DIR):
+            os.makedirs(TEST_DIR, exist_ok=True)
+            print(f"[TEST] Created test directory at: {TEST_DIR}")
+        
+        results = generate_test_files()
+        print(f"[TEST] Test file creation results: {results}")
+        return jsonify({
+            'status': 'success',
+            'results': results,
+            'message': f'Test files created in {TEST_DIR}'
+        })
+    except Exception as e:
+        print(f"[ERROR] Creating test files: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/test/cleanup', methods=['POST'])
+def cleanup_test_files_endpoint():
+    try:
+        success = cleanup_test_files()
+        if success:
+            return jsonify({
+                'status': 'success',
+                'message': 'Test files and quarantine cleaned up'
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'Partial cleanup completed with some errors'
+            }), 500
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 if __name__ == '__main__':
-    # Train the ML model
+    # Create directories
+    os.makedirs(QUARANTINE_DIR, exist_ok=True)
+    os.makedirs(TEST_DIR, exist_ok=True)
+    
+    # Train model
     train_anomaly_detection()
     
-    # Start monitoring threads
+    # Start monitoring
     start_monitoring()
     
-    # Start Flask API
+    # Start API
+    print("[SYSTEM] Starting Ransomware Detection System...")
     app.run(host='0.0.0.0', port=5000)
